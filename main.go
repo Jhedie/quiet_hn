@@ -8,9 +8,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/gophercises/quiet_hn/hn"
+	"github.com/Jhedie/quiet_hn/hn"
 )
 
 func main() {
@@ -38,18 +39,60 @@ func handler(numStories int, tpl *template.Template) http.HandlerFunc {
 			return
 		}
 		var stories []item
+
+		//safely append results to slice/stories
+		var mu sync.Mutex
+
+		//Wait group to wait for all go routines to finish
+		var wg sync.WaitGroup
+
+		storyChan := make(chan item, numStories)
+		done := make(chan struct{})
+
 		for _, id := range ids {
-			hnItem, err := client.GetItem(id)
-			if err != nil {
-				continue
-			}
-			item := parseHNItem(hnItem)
-			if isStoryLink(item) {
-				stories = append(stories, item)
-				if len(stories) >= numStories {
-					break
+			wg.Add(1)
+
+			go func(id int) {
+				defer wg.Done()
+				select {
+				case <-done:
+					// Exit early if enough stories have been collected
+					return
+				default:
+
+					hnItem, err := client.GetItem(id)
+					if err != nil {
+						fmt.Printf("Error fetching data for ID %d: %v\n", id, err)
+					}
+					item := parseHNItem(hnItem)
+					if isStoryLink(item) {
+						select {
+						case storyChan <- item:
+						case <-done:
+							// Exit if enough stories are already collected
+							return
+						}
+					}
 				}
+			}(id)
+		}
+		// Close the channel once all goroutines finish
+		go func() {
+			wg.Wait()
+			close(storyChan)
+		}()
+
+		// Collect stories from the channel
+		for story := range storyChan {
+			mu.Lock()
+			stories = append(stories, story)
+			if len(stories) >= numStories {
+				// Signal other goroutines to stop
+				close(done)
+				mu.Unlock()
+				break
 			}
+			mu.Unlock()
 		}
 		data := templateData{
 			Stories: stories,
